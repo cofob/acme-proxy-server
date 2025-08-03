@@ -1,3 +1,14 @@
+*.local
+local/
+
+/acme_server_state.json
+/certs
+
+*.pem
+*.cer
+
+.direnv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -136,7 +147,6 @@ celerybeat.pid
 
 # Environments
 .env
-.envrc
 .venv
 env/
 venv/
