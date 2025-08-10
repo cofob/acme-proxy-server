@@ -42,7 +42,8 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
     main_domain = identifiers[0]
     output_dir = Path(settings.CERT_STORAGE_PATH)
     key_output_path = output_dir / f"{main_domain}.key.pem"
-    chain_output_path = output_dir / f"{main_domain}.chain.pem"
+    cert_output_path = output_dir / f"{main_domain}.cert.pem"
+    chain_output_path = output_dir / f"{main_domain}.fullchain.pem"
     csr_path: Path | None = None
 
     async with ACME_SH_LOCK:
@@ -73,13 +74,24 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
             except Exception:
                 os.close(fd)
                 raise
-            command.extend(["--csr", str(csr_path), "--fullchain-file", str(chain_output_path)])
+            command.extend(
+                [
+                    "--csr",
+                    str(csr_path),
+                    "--cert-file",
+                    str(cert_output_path),
+                    "--fullchain-file",
+                    str(chain_output_path),
+                ]
+            )
         else:
             # No CSR provided: acme.sh will generate a new keypair and CSR.
             command.extend(
                 [
                     "--key-file",
                     str(key_output_path),
+                    "--cert-file",
+                    str(cert_output_path),
                     "--fullchain-file",
                     str(chain_output_path),
                 ]
@@ -120,12 +132,16 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
 
     if not chain_output_path.exists():
         raise FileNotFoundError(f"Certificate chain not found at {chain_output_path}")
+    if not cert_output_path.exists():
+        raise FileNotFoundError(f"Leaf certificate not found at {cert_output_path}")
 
     # Ensure certificate files have secure permissions (owner read/write only)
     if key_output_path.exists():
         os.chmod(key_output_path, stat.S_IRUSR | stat.S_IWUSR)
     if chain_output_path.exists():
         os.chmod(chain_output_path, stat.S_IRUSR | stat.S_IWUSR)
+    if cert_output_path.exists():
+        os.chmod(cert_output_path, stat.S_IRUSR | stat.S_IWUSR)
 
     # Best-effort cleanup of CSR file if we created one
     if csr_path and csr_path.exists():
@@ -134,4 +150,21 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
         except OSError:
             pass
 
-    return chain_output_path.read_text(encoding="utf-8")
+    # Ensure the returned content begins with the leaf certificate
+    cert_content = cert_output_path.read_text(encoding="utf-8").strip()
+    chain_content = chain_output_path.read_text(encoding="utf-8").strip()
+
+    # If the fullchain already starts with the leaf, return it as-is
+    if chain_content.startswith(cert_content.splitlines()[0]):
+        return chain_content + "\n"
+
+    # Otherwise, prepend the leaf to the chain
+    combined = cert_content + "\n" + chain_content + "\n"
+    # Also update the fullchain file on disk to the combined content for consistency
+    try:
+        with open(chain_output_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+    except Exception:
+        # Non-fatal; still return combined
+        pass
+    return combined
