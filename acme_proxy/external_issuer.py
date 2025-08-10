@@ -48,17 +48,17 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
     async with ACME_SH_LOCK:
         logger.info(f"Issuing new certificate for: {identifiers}")
 
+        # Require DNS API to be configured (we use DNS-01 to avoid HTTP serving)
+        if not settings.ACME_SH_DNS_API:
+            raise Exception(
+                "ACME_SH_DNS_API is not configured. Set a DNS provider (e.g., 'dns_cf') in settings or environment."
+            )
+
         # Prepare command and environment
-        command = [
-            settings.ACME_SH_PATH,
-            "--issue",
-            "--force",
-            "--dns",
-            settings.ACME_SH_DNS_API,
-            "--accountemail",
-            settings.ACME_SH_ACCOUNT_EMAIL,
-            "--log",
-        ]
+        command = [settings.ACME_SH_PATH]
+        # Use --signcsr when a CSR is provided, otherwise do a normal --issue
+        command.append("--signcsr" if csr_pem else "--issue")
+        command.extend(["--force", "--accountemail", settings.ACME_SH_ACCOUNT_EMAIL, "--log"])
 
         # If CSR is provided, write it securely and instruct acme.sh to use it.
         # In CSR mode, acme.sh derives identifiers from the CSR and does not
@@ -86,11 +86,11 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
             )
         if settings.ACME_SH_STAGING:
             command.append("--staging")
-        # When using an explicit CSR, acme.sh extracts domains from the CSR and
-        # does not require -d flags. Otherwise pass identifiers explicitly.
-        if not csr_pem:
-            for identifier in identifiers:
-                command.extend(["-d", identifier])
+        # Always pass identifiers; acme.sh expects at least one -d even with --signcsr
+        for identifier in identifiers:
+            command.extend(["-d", identifier])
+        # Use DNS-01 with configured provider
+        command.extend(["--dns", settings.ACME_SH_DNS_API])
 
         # Prepare environment variables for acme.sh DNS plugin
         env = os.environ.copy()
