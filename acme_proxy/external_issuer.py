@@ -98,9 +98,10 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
             )
         if settings.ACME_SH_STAGING:
             command.append("--staging")
-        # Always pass identifiers; acme.sh expects at least one -d even with --signcsr
-        for identifier in identifiers:
-            command.extend(["-d", identifier])
+        # Pass identifiers only in normal issue mode; for --signcsr acme.sh derives them from the CSR
+        if not csr_pem:
+            for identifier in identifiers:
+                command.extend(["-d", identifier])
         # Use DNS-01 with configured provider
         command.extend(["--dns", settings.ACME_SH_DNS_API])
 
@@ -150,17 +151,34 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
         except OSError:
             pass
 
-    # Ensure the returned content begins with the leaf certificate
+    # Ensure the returned content starts with the exact leaf certificate, without duplicates
     cert_content = cert_output_path.read_text(encoding="utf-8").strip()
     chain_content = chain_output_path.read_text(encoding="utf-8").strip()
 
-    # If the fullchain already starts with the leaf, return it as-is
-    if chain_content.startswith(cert_content.splitlines()[0]):
-        return chain_content + "\n"
+    def split_pem_blocks(pem_text: str) -> list[str]:
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in pem_text.splitlines():
+            current.append(line)
+            if line.strip() == "-----END CERTIFICATE-----":
+                block = "\n".join(current).strip()
+                blocks.append(block)
+                current = []
+        if current:
+            # Incomplete block; ignore
+            pass
+        return blocks
 
-    # Otherwise, prepend the leaf to the chain
-    combined = cert_content + "\n" + chain_content + "\n"
-    # Also update the fullchain file on disk to the combined content for consistency
+    leaf_block = cert_content
+    chain_blocks = split_pem_blocks(chain_content)
+
+    # Remove any existing occurrence of the leaf from the chain blocks
+    chain_blocks = [b for b in chain_blocks if b != leaf_block]
+
+    combined_blocks = [leaf_block] + chain_blocks
+    combined = "\n".join(combined_blocks) + "\n"
+
+    # Update the fullchain file on disk to the combined content for consistency
     try:
         with open(chain_output_path, "w", encoding="utf-8") as f:
             f.write(combined)

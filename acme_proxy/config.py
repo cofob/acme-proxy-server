@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     ACME_SH_DNS_API: str = ""
     # The email for the Let's Encrypt account used by acme.sh
     ACME_SH_ACCOUNT_EMAIL: str = ""
+    # Optional explicit ACME server for acme.sh (e.g., 'letsencrypt', 'letsencrypt_test')
+    ACME_SH_SERVER: str | None = None
 
     # --- DNS API Credentials ---
     # These must be set in your environment for acme.sh to work.

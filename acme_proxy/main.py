@@ -205,7 +205,7 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         csr_obj = x509.load_der_x509_csr(csr_der)
         csr_pub_any = csr_obj.public_key()
 
-        # Parse first certificate in the returned fullchain as the leaf
+        # Parse all certificates in the returned fullchain and pick the one that matches CSR public key
         pem_certs: list[bytes] = []
         current: list[str] = []
         for line in cert_content.splitlines():
@@ -216,8 +216,9 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         if not pem_certs:
             raise Exception("No PEM certificates found in returned fullchain content")
 
-        leaf_cert = x509.load_pem_x509_certificate(pem_certs[0])
-        leaf_pub_any = leaf_cert.public_key()
+        # Load first as default, but search for matching pubkey
+        candidate_cert = x509.load_pem_x509_certificate(pem_certs[0])
+        leaf_pub_any = candidate_cert.public_key()
 
         # Narrow types for mypy and validate supported key types
         if not isinstance(csr_pub_any, (RSAPublicKey, EllipticCurvePublicKey)):
@@ -225,9 +226,23 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         if not isinstance(leaf_pub_any, (RSAPublicKey, EllipticCurvePublicKey)):
             raise Exception(f"Unsupported certificate public key type: {type(leaf_pub_any)}")
         csr_pub: PublicKeyTypes = csr_pub_any
-        leaf_pub: PublicKeyTypes = leaf_pub_any
 
-        if not public_keys_equal(csr_pub, leaf_pub):
+        # Try to find a certificate whose pubkey equals CSR pubkey
+        matching_pub_found = False
+        for pem in pem_certs:
+            try:
+                cert = x509.load_pem_x509_certificate(pem)
+                cert_pub_any = cert.public_key()
+                if not isinstance(cert_pub_any, (RSAPublicKey, EllipticCurvePublicKey)):
+                    continue
+                cert_pub: PublicKeyTypes = cert_pub_any
+                if public_keys_equal(csr_pub, cert_pub):
+                    matching_pub_found = True
+                    break
+            except Exception:
+                continue
+
+        if not matching_pub_found:
             raise Exception("Issued certificate public key does not match CSR public key")
 
         # Store the certificate with secure file permissions
