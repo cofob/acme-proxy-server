@@ -33,6 +33,7 @@ from acme_proxy.security import (
     validate_csr,
     validate_ip_in_cidr_ranges,
     AcmeProblemError,
+    normalize_dns_identifier,
 )
 from acme_proxy.state import state
 from cryptography import x509
@@ -190,7 +191,7 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         order_identifiers = [ident["value"] for ident in order_obj_dict["identifiers"]]
 
         # Fail-fast if new-order accidentally contained duplicates (defense-in-depth)
-        if len(order_identifiers) != len(set(i.lower() for i in order_identifiers)):
+        if len(order_identifiers) != len({normalize_dns_identifier(i) for i in order_identifiers}):
             raise AcmeProblemError(
                 problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
                 detail="One or more identifiers are duplicated",
@@ -210,7 +211,7 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         seen: set[str] = set()
         unique_identifiers: list[str] = []
         for name in identifiers_to_issue:
-            key = name.lower()
+            key = normalize_dns_identifier(name)
             if key not in seen:
                 seen.add(key)
                 unique_identifiers.append(name)
@@ -389,7 +390,7 @@ async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verif
             )
 
     # Reject duplicate identifiers in the order per ACME semantics
-    values_lower = [i.value.lower() for i in payload.identifiers]
+    values_lower = [normalize_dns_identifier(i.value) for i in payload.identifiers]
     if len(values_lower) != len(set(values_lower)):
         raise HTTPException(
             status_code=400,

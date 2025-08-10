@@ -5,7 +5,7 @@ import hashlib
 import ipaddress
 import json
 import secrets
-from typing import Any, List
+from typing import Any, List, cast
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
@@ -40,6 +40,33 @@ class AcmeProblemError(Exception):
         self.problem_type = problem_type
         self.detail = detail
         self.status = status
+
+
+def normalize_dns_identifier(name: str) -> str:
+    """Normalize a DNS identifier for comparison and duplicate detection.
+
+    - Lowercase
+    - Strip trailing dot
+    - Convert Unicode to IDNA ASCII (punycode)
+    - Preserve a leading wildcard "*." but normalize the remainder
+    """
+    try:
+        working = name.strip().lower().rstrip(".")
+        if working.startswith("*."):
+            rest = working[2:]
+            # Convert rest to IDNA ASCII
+            try:
+                rest_idna = rest.encode("idna").decode("ascii")
+            except Exception:
+                rest_idna = rest
+            return "*." + rest_idna
+        # Non-wildcard
+        try:
+            return working.encode("idna").decode("ascii")
+        except Exception:
+            return working
+    except Exception:
+        return name.lower().rstrip(".")
 
 
 def calculate_jwk_thumbprint(public_jwk: dict[str, Any]) -> str:
@@ -97,16 +124,17 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
         if account_thumbprint == csr_thumbprint:
             raise ValueError("CSR public key must not be the same as account key")
 
-        # 2. Extract identifiers from CSR
-        csr_dns_names = set()
+        # 2. Extract identifiers from CSR (SANs only for ACME matching). Keep CN only for duplicate checks.
+        csr_dns_names: set[str] = set()
         san_dns_names_list: list[str] = []  # preserve order to detect duplicates in SAN
+        cn_normalized: str | None = None
 
         # Check subject common name
         try:
             subject = csr.subject
             for attribute in subject:
                 if attribute.oid == x509.NameOID.COMMON_NAME:
-                    csr_dns_names.add(attribute.value.lower())
+                    cn_normalized = normalize_dns_identifier(attribute.value)
         except Exception:
             pass  # No subject or CN is optional
 
@@ -114,12 +142,12 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
         try:
             san_ext = csr.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
             san_value = san_ext.value
-            if hasattr(san_value, "__iter__"):
-                for san in san_value:
-                    if isinstance(san, x509.DNSName):
-                        name_lower = san.value.lower()
-                        san_dns_names_list.append(name_lower)
-                        csr_dns_names.add(name_lower)
+            san_typed = cast(x509.SubjectAlternativeName, san_value)
+            dns_names = san_typed.get_values_for_type(x509.DNSName)
+            for dns_name in dns_names:
+                normalized = normalize_dns_identifier(dns_name)
+                san_dns_names_list.append(normalized)
+                csr_dns_names.add(normalized)
         except x509.ExtensionNotFound:
             pass  # SAN extension is optional
 
@@ -131,8 +159,17 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
                 status=400,
             )
 
+        # 2b. Detect duplicate between CN and SAN if both present
+        if cn_normalized is not None and san_dns_names_list:
+            if cn_normalized in set(san_dns_names_list):
+                raise AcmeProblemError(
+                    problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
+                    detail="Common Name duplicates a SAN identifier in the CSR",
+                    status=400,
+                )
+
         # 3. Verify CSR identifiers match order identifiers exactly
-        order_dns_names = {identifier.lower() for identifier in order_identifiers}
+        order_dns_names = {normalize_dns_identifier(identifier) for identifier in order_identifiers}
 
         if csr_dns_names != order_dns_names:
             raise AcmeProblemError(
