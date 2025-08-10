@@ -234,7 +234,12 @@ async def new_nonce(response: Response) -> Response:
     return response
 
 
-@app.post("/acme/new-account", status_code=201)
+@app.post(
+    "/acme/new-account",
+    status_code=201,
+    response_model=Account,
+    response_model_exclude_none=True,
+)
 async def new_account(response: Response, jws_data: dict[str, Any] = Depends(verify_jws)) -> Account:
     payload = NewAccountPayload(**jws_data["payload"])
     public_jwk = jws_data["jwk"]
@@ -271,7 +276,12 @@ async def new_account(response: Response, jws_data: dict[str, Any] = Depends(ver
     return account_obj
 
 
-@app.post("/acme/new-order", status_code=201)
+@app.post(
+    "/acme/new-order",
+    status_code=201,
+    response_model=Order,
+    response_model_exclude_none=True,
+)
 async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verify_jws)) -> Order:
     payload = NewOrderPayload(**jws_data["payload"])
     kid = jws_data["kid"]
@@ -324,7 +334,11 @@ async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verif
     return order
 
 
-@app.post("/acme/chall/{challenge_id}")
+@app.post(
+    "/acme/chall/{challenge_id}",
+    response_model=Challenge,
+    response_model_exclude_none=True,
+)
 async def respond_to_challenge(
     challenge_id: str,
     response: Response,
@@ -367,7 +381,11 @@ async def respond_to_challenge(
     return Challenge(**challenge_obj)
 
 
-@app.post("/acme/order/{order_id}/finalize")
+@app.post(
+    "/acme/order/{order_id}/finalize",
+    response_model=Order,
+    response_model_exclude_none=True,
+)
 async def finalize_order(
     order_id: str,
     response: Response,
@@ -447,7 +465,11 @@ async def download_cert(cert_id: str, response: Response, jws_data: dict[str, An
 # --- POST-as-GET endpoints for polling resources ---
 
 
-@app.post("/acme/order/{order_id}")
+@app.post(
+    "/acme/order/{order_id}",
+    response_model=Order,
+    response_model_exclude_none=True,
+)
 async def get_order(order_id: str, response: Response, jws_data: dict[str, Any] = Depends(verify_jws)) -> Order:
     # Check that payload is empty
     if jws_data["payload"]:
@@ -459,7 +481,11 @@ async def get_order(order_id: str, response: Response, jws_data: dict[str, Any] 
     return Order(**order_obj)
 
 
-@app.post("/acme/authz/{authz_id}")
+@app.post(
+    "/acme/authz/{authz_id}",
+    response_model=Authorization,
+    response_model_exclude_none=True,
+)
 async def get_authorization(
     authz_id: str, response: Response, jws_data: dict[str, Any] = Depends(verify_jws)
 ) -> Authorization:
