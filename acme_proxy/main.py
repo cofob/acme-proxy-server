@@ -465,8 +465,10 @@ async def download_cert(cert_id: str, response: Response, jws_data: dict[str, An
     with open(cert_path, "r") as f:
         cert_content = f.read()
 
-    await add_replay_nonce(response)
-    return Response(content=cert_content, media_type="application/pem-certificate-chain")
+    # Build the response object first so we can attach headers (nonce, link)
+    resp = Response(content=cert_content, media_type="application/pem-certificate-chain")
+    await add_replay_nonce(resp)
+    return resp
 
 
 # --- POST-as-GET endpoints for polling resources ---
