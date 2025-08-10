@@ -377,7 +377,14 @@ async def respond_to_challenge(
     else:
         logger.error(f"Could not find parent authorization/order for challenge {challenge_id}")
 
+    # Add standard headers including nonce and ACME directory index link
     await add_replay_nonce(response)
+
+    # Certbot requires an "up" Link header on challenge responses pointing to the parent authorization
+    if authz_id:
+        existing_link = response.headers.get("Link", "")
+        up_link = f'<{full_url_for(f"acme/authz/{authz_id}")}>;rel="up"'
+        response.headers["Link"] = f"{existing_link}, {up_link}" if existing_link else up_link
     return Challenge(**challenge_obj)
 
 
