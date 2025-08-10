@@ -34,6 +34,8 @@ from acme_proxy.security import (
     validate_ip_in_cidr_ranges,
 )
 from acme_proxy.state import state
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -180,6 +182,38 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
 
         # Use the provided CSR to ensure the certificate matches the client's key
         cert_content = await issue_certificate_with_acmesh(identifiers_to_issue, csr_pem=csr_pem)
+
+        # Verify issued leaf certificate public key matches CSR public key
+        csr_obj = x509.load_der_x509_csr(csr_der)
+        csr_pub = csr_obj.public_key()
+
+        # Parse first certificate in the returned fullchain as the leaf
+        pem_certs: list[bytes] = []
+        current: list[str] = []
+        for line in cert_content.splitlines():
+            current.append(line)
+            if line.strip() == "-----END CERTIFICATE-----":
+                pem_certs.append("\n".join(current).encode())
+                current = []
+        if not pem_certs:
+            raise Exception("No PEM certificates found in returned fullchain content")
+
+        leaf_cert = x509.load_pem_x509_certificate(pem_certs[0])
+        leaf_pub = leaf_cert.public_key()
+
+        def _pub_equal(a: Any, b: Any) -> bool:
+            if isinstance(a, rsa.RSAPublicKey) and isinstance(b, rsa.RSAPublicKey):
+                return a.public_numbers() == b.public_numbers()
+            if isinstance(a, ec.EllipticCurvePublicKey) and isinstance(b, ec.EllipticCurvePublicKey):
+                return (
+                    a.curve.name == b.curve.name
+                    and a.public_numbers().x == b.public_numbers().x
+                    and a.public_numbers().y == b.public_numbers().y
+                )
+            return False
+
+        if not _pub_equal(csr_pub, leaf_pub):
+            raise Exception("Issued certificate public key does not match CSR public key")
 
         # Store the certificate with secure file permissions
         cert_id = str(uuid.uuid4())
@@ -441,10 +475,12 @@ async def finalize_order(
             ).model_dump(by_alias=True, exclude_none=True),
         )
 
-    # Convert DER to PEM format for acme.sh
-    csr_pem = (
-        f"-----BEGIN CERTIFICATE REQUEST-----\n{base64.b64encode(csr_der).decode()}\n-----END CERTIFICATE REQUEST-----"
-    )
+    # Convert DER to PEM format for acme.sh with 64-character line wrapping
+    def _wrap64(b: bytes) -> str:
+        s = base64.b64encode(b).decode()
+        return "\n".join(s[i : i + 64] for i in range(0, len(s), 64))
+
+    csr_pem = "-----BEGIN CERTIFICATE REQUEST-----\n" + _wrap64(csr_der) + "\n-----END CERTIFICATE REQUEST-----"
 
     order_obj["status"] = "processing"
     await state.update_resource(order_id, "orders", order_obj)
