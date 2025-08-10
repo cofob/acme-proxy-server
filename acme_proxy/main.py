@@ -32,6 +32,7 @@ from acme_proxy.security import (
     get_key_authorization,
     validate_csr,
     validate_ip_in_cidr_ranges,
+    AcmeProblemError,
 )
 from acme_proxy.state import state
 from cryptography import x509
@@ -188,18 +189,34 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         # RFC 8555: Validate CSR according to security requirements
         order_identifiers = [ident["value"] for ident in order_obj_dict["identifiers"]]
 
+        # Fail-fast if new-order accidentally contained duplicates (defense-in-depth)
+        if len(order_identifiers) != len(set(i.lower() for i in order_identifiers)):
+            raise AcmeProblemError(
+                problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
+                detail="One or more identifiers are duplicated",
+                status=400,
+            )
+
         try:
             validate_csr(csr_der, order_identifiers, account_jwk)
             logger.info(f"CSR validation successful for order {order_id}")
-        except ValueError as e:
-            logger.error(f"CSR validation failed for order {order_id}: {e}")
-            raise Exception(f"CSR validation failed: {e}")
+        except AcmeProblemError:
+            # Re-raise structured ACME errors untouched
+            raise
 
         # Extract identifiers exactly as validated from the CSR
         identifiers_to_issue = [ident["value"] for ident in order_obj_dict["identifiers"]]
+        # Deduplicate while preserving order for stable file naming
+        seen: set[str] = set()
+        unique_identifiers: list[str] = []
+        for name in identifiers_to_issue:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                unique_identifiers.append(name)
 
         # Use the provided CSR to ensure the certificate matches the client's key
-        cert_content = await issue_certificate_with_acmesh(identifiers_to_issue, csr_pem=csr_pem)
+        cert_content = await issue_certificate_with_acmesh(unique_identifiers, csr_pem=csr_pem)
 
         # Verify issued leaf certificate public key matches CSR public key
         csr_obj = x509.load_der_x509_csr(csr_der)
@@ -265,6 +282,12 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
         await state.update_resource(order_id, "orders", order_obj_dict)
         logger.info(f"Certificate for order {order_id} issued and stored at {cert_path}")
 
+    except AcmeProblemError as e:
+        logger.error(f"Finalization failed for order {order_id}: {e.detail}")
+        order_obj_dict["status"] = "invalid"
+        error = Problem(type=e.problem_type, detail=e.detail, status=e.status)
+        order_obj_dict["error"] = error.model_dump(by_alias=True, exclude_none=True)
+        await state.update_resource(order_id, "orders", order_obj_dict)
     except Exception as e:
         logger.error(f"Finalization failed for order {order_id}: {e}")
         order_obj_dict["status"] = "invalid"
@@ -364,6 +387,18 @@ async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verif
                     status=403,
                 ).model_dump(by_alias=True, exclude_none=True),
             )
+
+    # Reject duplicate identifiers in the order per ACME semantics
+    values_lower = [i.value.lower() for i in payload.identifiers]
+    if len(values_lower) != len(set(values_lower)):
+        raise HTTPException(
+            status_code=400,
+            detail=Problem(
+                type="urn:ietf:params:acme:error:rejectedIdentifier",
+                detail="One or more identifiers are duplicated",
+                status=400,
+            ).model_dump(by_alias=True, exclude_none=True),
+        )
 
     order_id = str(uuid.uuid4())
     auth_urls = []

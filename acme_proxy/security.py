@@ -26,6 +26,22 @@ def b64_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
 
+class AcmeProblemError(Exception):
+    """Structured ACME problem error to propagate specific problem types.
+
+    Attributes:
+        problem_type: ACME problem type URN (e.g., "urn:ietf:params:acme:error:badCSR")
+        detail: Human-readable description
+        status: HTTP status code to surface in ACME problem object
+    """
+
+    def __init__(self, problem_type: str, detail: str, status: int) -> None:
+        super().__init__(f"{problem_type} ({status}): {detail}")
+        self.problem_type = problem_type
+        self.detail = detail
+        self.status = status
+
+
 def calculate_jwk_thumbprint(public_jwk: dict[str, Any]) -> str:
     """
     Calculates the JWK thumbprint according to RFC 7638.
@@ -83,6 +99,7 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
 
         # 2. Extract identifiers from CSR
         csr_dns_names = set()
+        san_dns_names_list: list[str] = []  # preserve order to detect duplicates in SAN
 
         # Check subject common name
         try:
@@ -100,15 +117,29 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
             if hasattr(san_value, "__iter__"):
                 for san in san_value:
                     if isinstance(san, x509.DNSName):
-                        csr_dns_names.add(san.value.lower())
+                        name_lower = san.value.lower()
+                        san_dns_names_list.append(name_lower)
+                        csr_dns_names.add(name_lower)
         except x509.ExtensionNotFound:
             pass  # SAN extension is optional
+
+        # 2a. Detect duplicates within SAN entries specifically, which ACME servers reject
+        if len(san_dns_names_list) != len(set(san_dns_names_list)):
+            raise AcmeProblemError(
+                problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
+                detail="One or more identifiers are duplicated in the CSR Subject Alternative Name extension",
+                status=400,
+            )
 
         # 3. Verify CSR identifiers match order identifiers exactly
         order_dns_names = {identifier.lower() for identifier in order_identifiers}
 
         if csr_dns_names != order_dns_names:
-            raise ValueError(f"CSR identifiers {csr_dns_names} do not match order identifiers {order_dns_names}")
+            raise AcmeProblemError(
+                problem_type="urn:ietf:params:acme:error:badCSR",
+                detail=f"CSR identifiers {csr_dns_names} do not match order identifiers {order_dns_names}",
+                status=400,
+            )
 
         # 4. Validate that no unauthorized extensions are present
         allowed_extensions = {
@@ -123,9 +154,15 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
                 raise ValueError(f"Unauthorized extension in CSR: {extension.oid}")
 
     except Exception as e:
-        if isinstance(e, ValueError):
+        # Re-raise structured ACME problem errors as-is
+        if isinstance(e, AcmeProblemError):
             raise
-        raise ValueError(f"Failed to parse or validate CSR: {e}")
+        # Wrap any parsing errors as badCSR
+        raise AcmeProblemError(
+            problem_type="urn:ietf:params:acme:error:badCSR",
+            detail=f"Failed to parse or validate CSR: {e}",
+            status=400,
+        )
 
 
 def _public_key_to_jwk(public_key: Any) -> dict[str, Any]:

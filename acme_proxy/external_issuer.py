@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List
 
 from acme_proxy.config import settings
+from acme_proxy.security import AcmeProblemError
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +125,18 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
 
         if process.returncode != 0:
             logger.error(f"acme.sh failed for {main_domain}.")
-            logger.error(f"STDOUT: {stdout.decode()}")
-            logger.error(f"STDERR: {stderr.decode()}")
-            raise Exception(f"acme.sh execution failed: {stderr.decode()}")
+            out = stdout.decode()
+            err = stderr.decode()
+            logger.error(f"STDOUT: {out}")
+            logger.error(f"STDERR: {err}")
+            # Map common duplicate identifier error to ACME problem
+            if "duplicated" in err.lower() or "duplicated" in out.lower():
+                raise AcmeProblemError(
+                    problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
+                    detail="One or more identifiers are duplicated",
+                    status=400,
+                )
+            raise Exception(f"acme.sh execution failed: {err}")
 
         logger.info(f"acme.sh successfully issued certificate for {main_domain}.")
         logger.debug(f"STDOUT: {stdout.decode()}")
