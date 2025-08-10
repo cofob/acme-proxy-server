@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     ALLOWED_CHALLENGE_CIDR: str = ""
 
     # JWS algorithms allowed for request signatures
-    ALLOWED_JWS_ALGORITHMS: list[str] = ["ES256", "EdDSA"]
+    ALLOWED_JWS_ALGORITHMS: list[str] = ["ES256", "EdDSA", "RS256"]
 
     class Config:
         env_file = ".env"
