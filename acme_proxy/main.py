@@ -6,7 +6,7 @@ import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
@@ -36,6 +36,8 @@ from acme_proxy.security import (
 from acme_proxy.state import state
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -47,6 +49,22 @@ app = FastAPI()
 # --- Helper Functions ---
 def full_url_for(path: str) -> str:
     return f"{settings.SERVER_URL.rstrip('/')}/{path.lstrip('/')}"
+
+
+# Public key equality helper (module-level with full typing for mypy)
+PublicKeyTypes = Union[RSAPublicKey, EllipticCurvePublicKey]
+
+
+def public_keys_equal(a: PublicKeyTypes, b: PublicKeyTypes) -> bool:
+    if isinstance(a, rsa.RSAPublicKey) and isinstance(b, rsa.RSAPublicKey):
+        return a.public_numbers() == b.public_numbers()
+    if isinstance(a, ec.EllipticCurvePublicKey) and isinstance(b, ec.EllipticCurvePublicKey):
+        return (
+            a.curve.name == b.curve.name
+            and a.public_numbers().x == b.public_numbers().x
+            and a.public_numbers().y == b.public_numbers().y
+        )
+    return False
 
 
 async def add_replay_nonce(response: Response) -> None:
@@ -185,7 +203,7 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
 
         # Verify issued leaf certificate public key matches CSR public key
         csr_obj = x509.load_der_x509_csr(csr_der)
-        csr_pub = csr_obj.public_key()
+        csr_pub_any = csr_obj.public_key()
 
         # Parse first certificate in the returned fullchain as the leaf
         pem_certs: list[bytes] = []
@@ -199,20 +217,17 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
             raise Exception("No PEM certificates found in returned fullchain content")
 
         leaf_cert = x509.load_pem_x509_certificate(pem_certs[0])
-        leaf_pub = leaf_cert.public_key()
+        leaf_pub_any = leaf_cert.public_key()
 
-        def _pub_equal(a: Any, b: Any) -> bool:
-            if isinstance(a, rsa.RSAPublicKey) and isinstance(b, rsa.RSAPublicKey):
-                return a.public_numbers() == b.public_numbers()
-            if isinstance(a, ec.EllipticCurvePublicKey) and isinstance(b, ec.EllipticCurvePublicKey):
-                return (
-                    a.curve.name == b.curve.name
-                    and a.public_numbers().x == b.public_numbers().x
-                    and a.public_numbers().y == b.public_numbers().y
-                )
-            return False
+        # Narrow types for mypy and validate supported key types
+        if not isinstance(csr_pub_any, (RSAPublicKey, EllipticCurvePublicKey)):
+            raise Exception(f"Unsupported CSR public key type: {type(csr_pub_any)}")
+        if not isinstance(leaf_pub_any, (RSAPublicKey, EllipticCurvePublicKey)):
+            raise Exception(f"Unsupported certificate public key type: {type(leaf_pub_any)}")
+        csr_pub: PublicKeyTypes = csr_pub_any
+        leaf_pub: PublicKeyTypes = leaf_pub_any
 
-        if not _pub_equal(csr_pub, leaf_pub):
+        if not public_keys_equal(csr_pub, leaf_pub):
             raise Exception("Issued certificate public key does not match CSR public key")
 
         # Store the certificate with secure file permissions
