@@ -175,11 +175,11 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
             logger.error(f"CSR validation failed for order {order_id}: {e}")
             raise Exception(f"CSR validation failed: {e}")
 
-        # Prepare identifiers for acme.sh, including wildcard
-        main_domain = order_obj_dict["identifiers"][0]["value"]
-        identifiers_to_issue = [main_domain, f"*.{main_domain}"]
+        # Extract identifiers exactly as validated from the CSR
+        identifiers_to_issue = [ident["value"] for ident in order_obj_dict["identifiers"]]
 
-        cert_content = await issue_certificate_with_acmesh(identifiers_to_issue)
+        # Use the provided CSR to ensure the certificate matches the client's key
+        cert_content = await issue_certificate_with_acmesh(identifiers_to_issue, csr_pem=csr_pem)
 
         # Store the certificate with secure file permissions
         cert_id = str(uuid.uuid4())

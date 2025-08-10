@@ -15,12 +15,15 @@ logger = logging.getLogger(__name__)
 ACME_SH_LOCK = asyncio.Lock()
 
 
-async def issue_certificate_with_acmesh(identifiers: List[str]) -> str:
+async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | None = None) -> str:
     """
     Calls acme.sh to issue a certificate for the given identifiers.
 
     Args:
         identifiers: A list of domain names.
+        csr_pem: Optional PEM-encoded CSR content. When provided, acme.sh will
+            use this CSR and will not generate or manage a private key. The
+            resulting certificate will match the CSR's public key.
 
     Returns:
         The content of the full certificate chain (fullchain.cer).
@@ -40,6 +43,7 @@ async def issue_certificate_with_acmesh(identifiers: List[str]) -> str:
     output_dir = Path(settings.CERT_STORAGE_PATH)
     key_output_path = output_dir / f"{main_domain}.key.pem"
     chain_output_path = output_dir / f"{main_domain}.chain.pem"
+    csr_path: Path | None = None
 
     async with ACME_SH_LOCK:
         logger.info(f"Issuing new certificate for: {identifiers}")
@@ -54,15 +58,39 @@ async def issue_certificate_with_acmesh(identifiers: List[str]) -> str:
             "--accountemail",
             settings.ACME_SH_ACCOUNT_EMAIL,
             "--log",
-            "--key-file",
-            str(key_output_path),
-            "--fullchain-file",
-            str(chain_output_path),
         ]
+
+        # If CSR is provided, write it securely and instruct acme.sh to use it.
+        # In CSR mode, acme.sh derives identifiers from the CSR and does not
+        # generate or save a private key.
+        if csr_pem:
+            # Securely create CSR file with owner read/write only
+            csr_path = output_dir / f"{main_domain}.csr.pem"
+            fd = os.open(csr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(csr_pem)
+            except Exception:
+                os.close(fd)
+                raise
+            command.extend(["--csr", str(csr_path), "--fullchain-file", str(chain_output_path)])
+        else:
+            # No CSR provided: acme.sh will generate a new keypair and CSR.
+            command.extend(
+                [
+                    "--key-file",
+                    str(key_output_path),
+                    "--fullchain-file",
+                    str(chain_output_path),
+                ]
+            )
         if settings.ACME_SH_STAGING:
             command.append("--staging")
-        for identifier in identifiers:
-            command.extend(["-d", identifier])
+        # When using an explicit CSR, acme.sh extracts domains from the CSR and
+        # does not require -d flags. Otherwise pass identifiers explicitly.
+        if not csr_pem:
+            for identifier in identifiers:
+                command.extend(["-d", identifier])
 
         # Prepare environment variables for acme.sh DNS plugin
         env = os.environ.copy()
@@ -98,5 +126,12 @@ async def issue_certificate_with_acmesh(identifiers: List[str]) -> str:
         os.chmod(key_output_path, stat.S_IRUSR | stat.S_IWUSR)
     if chain_output_path.exists():
         os.chmod(chain_output_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    # Best-effort cleanup of CSR file if we created one
+    if csr_path and csr_path.exists():
+        try:
+            os.remove(csr_path)
+        except OSError:
+            pass
 
     return chain_output_path.read_text(encoding="utf-8")
