@@ -159,14 +159,8 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
                 status=400,
             )
 
-        # 2b. Detect duplicate between CN and SAN if both present
-        if cn_normalized is not None and san_dns_names_list:
-            if cn_normalized in set(san_dns_names_list):
-                raise AcmeProblemError(
-                    problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
-                    detail="Common Name duplicates a SAN identifier in the CSR",
-                    status=400,
-                )
+        # 2b. Allow CN to duplicate a SAN entry. Many CAs ignore CN and rely on SANs; duplication is permissible.
+        # Intentionally do not treat CN matching a SAN as an error.
 
         # 3. Verify CSR identifiers match order identifiers exactly
         order_dns_names = {normalize_dns_identifier(identifier) for identifier in order_identifiers}
