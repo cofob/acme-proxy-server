@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import stat
+import shlex
 from pathlib import Path
 from typing import List
 
@@ -85,6 +86,14 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
                     str(chain_output_path),
                 ]
             )
+            # Append any additional user-specified flags for the --issue flow
+            if settings.ACME_SH_ADDITIONAL.strip():
+                try:
+                    additional_args = shlex.split(settings.ACME_SH_ADDITIONAL)
+                    command.extend(additional_args)
+                except ValueError:
+                    # If parsing fails, ignore additional flags to avoid breaking issuance
+                    pass
         else:
             # No CSR provided: acme.sh will generate a new keypair and CSR.
             command.extend(
@@ -97,6 +106,14 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
                     str(chain_output_path),
                 ]
             )
+            # Append any additional user-specified flags for the --issue flow
+            if settings.ACME_SH_ADDITIONAL.strip():
+                try:
+                    additional_args = shlex.split(settings.ACME_SH_ADDITIONAL)
+                    command.extend(additional_args)
+                except ValueError:
+                    # If parsing fails, ignore additional flags to avoid breaking issuance
+                    pass
         if settings.ACME_SH_STAGING:
             command.append("--staging")
         # Pass identifiers only in normal issue mode; for --signcsr acme.sh derives them from the CSR

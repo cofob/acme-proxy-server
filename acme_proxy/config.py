@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # The email for the Let's Encrypt account used by acme.sh
     ACME_SH_ACCOUNT_EMAIL: str = ""
 
+    # Additional arguments for acme.sh when using the --issue flow (no CSR provided).
+    # This string is split with shell-like parsing (shlex.split) and appended to the
+    # acme.sh command. Example: "--keylength 4096 --dnssleep 30"
+    ACME_SH_ADDITIONAL: str = ""
+
     # --- DNS API Credentials ---
     # These must be set in your environment for acme.sh to work.
     # Example for Cloudflare:
