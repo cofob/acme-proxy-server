@@ -124,19 +124,9 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
         if account_thumbprint == csr_thumbprint:
             raise ValueError("CSR public key must not be the same as account key")
 
-        # 2. Extract identifiers from CSR (SANs only for ACME matching). Keep CN only for duplicate checks.
+        # 2. Extract identifiers from CSR (SANs are authoritative for ACME matching).
         csr_dns_names: set[str] = set()
         san_dns_names_list: list[str] = []  # preserve order to detect duplicates in SAN
-        cn_normalized: str | None = None
-
-        # Check subject common name
-        try:
-            subject = csr.subject
-            for attribute in subject:
-                if attribute.oid == x509.NameOID.COMMON_NAME:
-                    cn_normalized = normalize_dns_identifier(attribute.value)
-        except Exception:
-            pass  # No subject or CN is optional
 
         # Check Subject Alternative Name extension
         try:
@@ -159,8 +149,7 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
                 status=400,
             )
 
-        # 2b. Allow CN to duplicate a SAN entry. Many CAs ignore CN and rely on SANs; duplication is permissible.
-        # Intentionally do not treat CN matching a SAN as an error.
+        # CN is ignored for matching and duplicate checks; SANs are authoritative.
 
         # 3. Verify CSR identifiers match order identifiers exactly
         order_dns_names = {normalize_dns_identifier(identifier) for identifier in order_identifiers}
