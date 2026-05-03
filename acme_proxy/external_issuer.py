@@ -2,10 +2,10 @@ import asyncio
 import logging
 import os
 import re
-import stat
 import shlex
+import stat
+import sys
 from pathlib import Path
-from typing import List
 
 from acme_proxy.config import settings
 from acme_proxy.security import AcmeProblemError
@@ -17,7 +17,100 @@ logger = logging.getLogger(__name__)
 ACME_SH_LOCK = asyncio.Lock()
 
 
-async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | None = None) -> str:
+def _write_openssl_csr_filter_wrapper(wrapper_path: Path) -> None:
+    """Write an openssl shim that hides duplicate CN/SAN DNS entries from acme.sh CSR parsing."""
+    wrapper_source = f"""#!{sys.executable}
+import os
+import re
+import subprocess
+import sys
+
+
+def arg_after(args, option):
+    try:
+        index = args.index(option)
+    except ValueError:
+        return None
+    next_index = index + 1
+    if next_index >= len(args):
+        return None
+    return args[next_index]
+
+
+def should_filter(args):
+    return args[:1] == ["req"] and "-noout" in args and "-text" in args
+
+
+def common_name(real_openssl, csr_path):
+    proc = subprocess.run(
+        [real_openssl, "req", "-noout", "-in", csr_path, "-subject"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"CN\\s*=\\s*([^,/]+)", proc.stdout)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def filter_duplicate_san(text, cn):
+    target = f"DNS:{{cn}}"
+    filtered_lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("DNS:"):
+            indent = line[: len(line) - len(stripped)]
+            entries = [entry.strip() for entry in stripped.split(",")]
+            entries = [entry for entry in entries if entry != target]
+            if not entries:
+                continue
+            line = indent + ", ".join(entries)
+        filtered_lines.append(line)
+    newline = "\\n" if text.endswith("\\n") else ""
+    return "\\n".join(filtered_lines) + newline
+
+
+def main():
+    real_openssl = os.environ.get("ACME_PROXY_REAL_OPENSSL", "openssl")
+    args = sys.argv[1:]
+    csr_path = os.environ.get("ACME_PROXY_SIGNCSR_PATH")
+    input_path = arg_after(args, "-in")
+
+    if should_filter(args) and input_path and (not csr_path or input_path == csr_path):
+        proc = subprocess.run(
+            [real_openssl, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        sys.stderr.write(proc.stderr)
+        if proc.returncode != 0:
+            sys.stdout.write(proc.stdout)
+            return proc.returncode
+        cn = common_name(real_openssl, input_path)
+        if cn:
+            sys.stdout.write(filter_duplicate_san(proc.stdout, cn))
+        else:
+            sys.stdout.write(proc.stdout)
+        return 0
+
+    os.execvp(real_openssl, [real_openssl, *args])
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+    wrapper_path.write_text(wrapper_source, encoding="utf-8")
+    os.chmod(wrapper_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+async def issue_certificate_with_acmesh(identifiers: list[str], csr_pem: str | None = None) -> str:
     """
     Calls acme.sh to issue a certificate for the given identifiers.
 
@@ -47,6 +140,7 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
     cert_output_path = output_dir / f"{main_domain}.cert.pem"
     chain_output_path = output_dir / f"{main_domain}.fullchain.pem"
     csr_path: Path | None = None
+    openssl_wrapper_path: Path | None = None
 
     async with ACME_SH_LOCK:
         logger.info(f"Issuing new certificate for: {identifiers}")
@@ -129,6 +223,13 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
             env["CF_KEY"] = settings.CF_KEY
         if settings.CF_EMAIL:
             env["CF_EMAIL"] = settings.CF_EMAIL
+        if csr_path is not None:
+            real_openssl = env.get("ACME_OPENSSL_BIN", "openssl")
+            openssl_wrapper_path = output_dir / ".acme-proxy-openssl-filter.py"
+            _write_openssl_csr_filter_wrapper(openssl_wrapper_path)
+            env["ACME_PROXY_REAL_OPENSSL"] = real_openssl
+            env["ACME_PROXY_SIGNCSR_PATH"] = str(csr_path)
+            env["ACME_OPENSSL_BIN"] = str(openssl_wrapper_path)
         # Add other DNS providers' env vars here
 
         process = await asyncio.create_subprocess_exec(
@@ -171,12 +272,13 @@ async def issue_certificate_with_acmesh(identifiers: List[str], csr_pem: str | N
     if cert_output_path.exists():
         os.chmod(cert_output_path, stat.S_IRUSR | stat.S_IWUSR)
 
-    # Best-effort cleanup of CSR file if we created one
-    if csr_path and csr_path.exists():
-        try:
-            os.remove(csr_path)
-        except OSError:
-            pass
+    # Best-effort cleanup of temporary files we created
+    for temporary_path in (csr_path, openssl_wrapper_path):
+        if temporary_path and temporary_path.exists():
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
 
     # Ensure the returned content starts with the exact leaf certificate, without duplicates
     cert_content = cert_output_path.read_text(encoding="utf-8").strip()

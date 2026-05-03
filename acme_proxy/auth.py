@@ -10,8 +10,17 @@ from jose import exceptions, jws
 
 from acme_proxy.config import settings
 from acme_proxy.models import Problem
-from acme_proxy.security import is_algorithm_allowed
+from acme_proxy.security import generate_nonce, is_algorithm_allowed
 from acme_proxy.state import state
+
+
+async def _fresh_nonce_headers() -> dict[str, str]:
+    nonce = generate_nonce()
+    await state.add_nonce(nonce)
+    return {
+        "Replay-Nonce": nonce,
+        "Link": f'<{settings.SERVER_URL.rstrip("/")}/directory>;rel="index"',
+    }
 
 
 async def verify_jws(request: Request) -> dict[str, Any]:
@@ -36,6 +45,7 @@ async def verify_jws(request: Request) -> dict[str, Any]:
         if not nonce or not await state.use_nonce(nonce):
             raise HTTPException(
                 status_code=http_status.HTTP_400_BAD_REQUEST,
+                headers=await _fresh_nonce_headers(),
                 detail=Problem(
                     type="urn:ietf:params:acme:error:badNonce",
                     detail="Invalid anti-replay nonce.",
@@ -79,10 +89,21 @@ async def verify_jws(request: Request) -> dict[str, Any]:
             )
 
         # 4. Signature Verification
+        has_jwk = "jwk" in protected_header
+        has_kid = "kid" in protected_header
+        if has_jwk == has_kid:
+            raise ValueError("JWS protected header must contain exactly one of 'jwk' or 'kid'")
+
+        is_new_account = request.url.path == "/acme/new-account"
+        if is_new_account and not has_jwk:
+            raise ValueError("newAccount requests must use a 'jwk' protected header")
+        if not is_new_account and not has_kid:
+            raise ValueError("Existing-account requests must use a 'kid' protected header")
+
         public_key_jwk = None
-        if "jwk" in protected_header:  # For newAccount requests
+        if has_jwk:
             public_key_jwk = protected_header["jwk"]
-        elif "kid" in protected_header:  # For existing accounts
+        else:
             account_data = await state.get_account_by_kid(protected_header["kid"])
             if not account_data:
                 raise HTTPException(
@@ -94,8 +115,6 @@ async def verify_jws(request: Request) -> dict[str, Any]:
                     ).model_dump(by_alias=True, exclude_none=True),
                 )
             public_key_jwk = account_data["jwk"]
-        else:
-            raise ValueError("JWS must have 'jwk' or 'kid' in protected header")
 
         # Reconstruct the JWS compact serialization string for verification
         compact_jws = f"{req_body['protected']}.{req_body['payload']}.{req_body['signature']}"

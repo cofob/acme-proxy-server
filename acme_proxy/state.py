@@ -15,20 +15,27 @@ class StateManager:
     def __init__(self, file_path: str):
         self.file_path = Path(file_path)
         self._lock = asyncio.Lock()
-        self.data: dict[str, Any] = {
+        self.data = self._default_data()
+        self.load()
+
+    def _default_data(self) -> dict[str, Any]:
+        return {
             "accounts": {},  # {kid: {"jwk": ..., "obj": account_obj}}
             "orders": {},  # {order_id: order_obj}
             "authorizations": {},  # {authz_id: authz_obj}
             "challenges": {},  # {challenge_id: challenge_obj}
+            "certificates": {},  # {cert_id: {"account": kid, "order": order_id}}
             "nonces": {},  # {nonce: expiry_timestamp}
         }
-        self.load()
 
     def load(self) -> None:
         if self.file_path.exists():
             try:
                 with open(self.file_path, "r") as f:
                     loaded_data = json.load(f)
+                    merged_data = self._default_data()
+                    merged_data.update(loaded_data)
+                    loaded_data = merged_data
 
                     # Handle nonce format migration: list/set -> dict with timestamps
                     nonces = loaded_data.get("nonces", {})
@@ -118,10 +125,11 @@ class StateManager:
     async def get_account_by_key(self, public_jwk: dict[str, Any]) -> Any | None:
         async with self._lock:
             key_thumbprint = calculate_jwk_thumbprint(public_jwk)
-            for acc in self.data["accounts"].values():
+            for kid, acc in self.data["accounts"].items():
                 # Check if the thumbprint matches the one stored with the account
                 if acc.get("thumbprint") == key_thumbprint:
-                    return acc["obj"]
+                    acc.setdefault("kid", kid)
+                    return acc
             return None
 
     async def get_account_by_kid(self, kid: str) -> Any | None:
@@ -132,7 +140,7 @@ class StateManager:
         async with self._lock:
             # Calculate and store the thumbprint when the account is created
             thumbprint = calculate_jwk_thumbprint(public_jwk)
-            self.data["accounts"][kid] = {"jwk": public_jwk, "obj": account_obj, "thumbprint": thumbprint}
+            self.data["accounts"][kid] = {"kid": kid, "jwk": public_jwk, "obj": account_obj, "thumbprint": thumbprint}
         await self.save()
 
     async def add_order(self, order_id: str, order_obj: dict[str, Any]) -> None:
@@ -148,6 +156,11 @@ class StateManager:
     async def add_challenge(self, challenge_id: str, challenge_obj: dict[str, Any]) -> None:
         async with self._lock:
             self.data["challenges"][challenge_id] = challenge_obj
+        await self.save()
+
+    async def add_certificate(self, cert_id: str, cert_obj: dict[str, Any]) -> None:
+        async with self._lock:
+            self.data["certificates"][cert_id] = cert_obj
         await self.save()
 
     # Generic getters and updaters to handle objects by reference

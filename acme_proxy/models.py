@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -12,17 +10,17 @@ class Problem(BaseModel):
     type: str
     detail: str
     status: int
-    subproblems: Optional[List["Problem"]] = None
-    identifier: Optional[Identifier] = None
-    algorithms: Optional[List[str]] = None  # For badSignatureAlgorithm errors
+    subproblems: list["Problem"] | None = None
+    identifier: Identifier | None = None
+    algorithms: list[str] | None = None  # For badSignatureAlgorithm errors
 
 
 class Directory(BaseModel):
     new_nonce: str = Field(..., serialization_alias="newNonce")
     new_account: str = Field(..., serialization_alias="newAccount")
     new_order: str = Field(..., serialization_alias="newOrder")
-    revoke_cert: str = Field(..., serialization_alias="revokeCert")
-    key_change: str = Field(..., serialization_alias="keyChange")
+    revoke_cert: str | None = Field(None, serialization_alias="revokeCert")
+    key_change: str | None = Field(None, serialization_alias="keyChange")
     meta: dict[str, str] = Field(
         default_factory=lambda: {
             "termsOfService": "https://f0rth.space/none",
@@ -33,21 +31,21 @@ class Directory(BaseModel):
 
 class Account(BaseModel):
     status: str = "valid"
-    contact: Optional[List[str]] = []
-    terms_of_service_agreed: Optional[bool] = Field(None, alias="termsOfServiceAgreed")
+    contact: list[str] | None = Field(default_factory=list)
+    terms_of_service_agreed: bool | None = Field(None, alias="termsOfServiceAgreed")
     orders: str
 
 
 class Order(BaseModel):
     status: str = "pending"
-    expires: Optional[str] = None
-    identifiers: List[Identifier]
-    not_before: Optional[str] = Field(None, alias="notBefore")
-    not_after: Optional[str] = Field(None, alias="notAfter")
-    authorizations: List[str]
+    expires: str | None = None
+    identifiers: list[Identifier]
+    not_before: str | None = Field(None, alias="notBefore")
+    not_after: str | None = Field(None, alias="notAfter")
+    authorizations: list[str]
     finalize: str
-    certificate: Optional[str] = None
-    error: Optional[Problem] = None
+    certificate: str | None = None
+    error: Problem | None = None
 
 
 class Challenge(BaseModel):
@@ -55,29 +53,29 @@ class Challenge(BaseModel):
     url: str
     status: str = "pending"
     token: str
-    validated: Optional[str] = None
-    error: Optional[Problem] = None
+    validated: str | None = None
+    error: Problem | None = None
 
 
 class Authorization(BaseModel):
     identifier: Identifier
     status: str = "pending"
-    expires: Optional[str] = None
-    challenges: List[Challenge]
-    wildcard: Optional[bool] = False
+    expires: str | None = None
+    challenges: list[Challenge]
+    wildcard: bool | None = None
 
 
 # Models for request payloads
 class NewOrderPayload(BaseModel):
-    identifiers: List[Identifier]
-    not_before: Optional[str] = Field(None, alias="notBefore")
-    not_after: Optional[str] = Field(None, alias="notAfter")
+    identifiers: list[Identifier]
+    not_before: str | None = Field(None, alias="notBefore")
+    not_after: str | None = Field(None, alias="notAfter")
 
 
 class NewAccountPayload(BaseModel):
-    contact: Optional[List[str]] = []
-    terms_of_service_agreed: Optional[bool] = Field(None, alias="termsOfServiceAgreed")
-    only_return_existing: Optional[bool] = Field(None, alias="onlyReturnExisting")
+    contact: list[str] | None = Field(default_factory=list)
+    terms_of_service_agreed: bool | None = Field(None, alias="termsOfServiceAgreed")
+    only_return_existing: bool | None = Field(None, alias="onlyReturnExisting")
 
 
 class FinalizePayload(BaseModel):

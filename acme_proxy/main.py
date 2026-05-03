@@ -1,12 +1,13 @@
+import asyncio
 import base64
 import logging
 import os
 import socket
 import stat
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
@@ -47,14 +48,118 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+ORDER_EXPIRES_AFTER = timedelta(days=7)
+AUTHORIZATION_EXPIRES_AFTER = timedelta(days=30)
+
 
 # --- Helper Functions ---
 def full_url_for(path: str) -> str:
     return f"{settings.SERVER_URL.rstrip('/')}/{path.lstrip('/')}"
 
 
+def acme_timestamp_after(delta: timedelta) -> str:
+    return (datetime.now(timezone.utc) + delta).isoformat()
+
+
+def is_owned_by(resource: dict[str, Any], kid: str) -> bool:
+    return resource.get("account") == kid
+
+
+def dns_identifier_for_authorization(identifier: str) -> tuple[str, bool]:
+    normalized = normalize_dns_identifier(identifier)
+    if normalized.startswith("*."):
+        return normalized[2:], True
+    return normalized, False
+
+
+def is_identifier_allowed(identifier: str) -> bool:
+    if not settings.BASE_DOMAIN_SUFFIX:
+        return True
+
+    authz_identifier, _ = dns_identifier_for_authorization(identifier)
+    allowed_suffix = normalize_dns_identifier(settings.BASE_DOMAIN_SUFFIX)
+    return authz_identifier == allowed_suffix or authz_identifier.endswith(f".{allowed_suffix}")
+
+
+def http_url_host(ip_address: str) -> str:
+    if ":" in ip_address:
+        return f"[{ip_address}]"
+    return ip_address
+
+
+async def resolve_http01_addresses(domain: str) -> list[str]:
+    loop = asyncio.get_running_loop()
+    try:
+        address_info = await loop.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"Failed to resolve domain {domain}") from e
+
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for info in address_info:
+        ip_address = info[4][0]
+        if ip_address not in seen:
+            seen.add(ip_address)
+            addresses.append(ip_address)
+
+    if not addresses:
+        raise ValueError(f"Domain {domain} did not resolve to any address")
+
+    if settings.ALLOWED_CHALLENGE_CIDR:
+        blocked_addresses = [
+            ip_address
+            for ip_address in addresses
+            if not validate_ip_in_cidr_ranges(ip_address, settings.ALLOWED_CHALLENGE_CIDR)
+        ]
+        if blocked_addresses:
+            raise ValueError(
+                f"Domain {domain} resolves outside the allowed CIDR ranges: {settings.ALLOWED_CHALLENGE_CIDR}"
+            )
+
+    return addresses
+
+
+async def find_parent_ids_for_challenge(challenge_id: str, kid: str) -> tuple[str | None, str | None]:
+    challenge_obj = await state.get_resource(challenge_id, "challenges")
+    if challenge_obj and is_owned_by(challenge_obj, kid):
+        authz_id = challenge_obj.get("authorization")
+        order_id = challenge_obj.get("order")
+        if isinstance(authz_id, str) and isinstance(order_id, str):
+            return authz_id, order_id
+
+    for oid, order_obj in (await state.get_resource(None, "orders")).items():
+        if not is_owned_by(order_obj, kid):
+            continue
+        for auth_url in order_obj["authorizations"]:
+            aid = auth_url.split("/")[-1]
+            auth_obj = await state.get_resource(aid, "authorizations")
+            if not auth_obj or not is_owned_by(auth_obj, kid):
+                continue
+            if any(challenge["url"].endswith(challenge_id) for challenge in auth_obj["challenges"]):
+                return aid, oid
+    return None, None
+
+
+async def get_owned_certificate(cert_id: str, kid: str) -> dict[str, Any] | None:
+    cert_obj = await state.get_resource(cert_id, "certificates")
+    if cert_obj:
+        if is_owned_by(cert_obj, kid):
+            return cert_obj
+        return None
+
+    cert_url = full_url_for(f"acme/cert/{cert_id}")
+    for order_id, order_obj in (await state.get_resource(None, "orders")).items():
+        if is_owned_by(order_obj, kid) and order_obj.get("certificate") == cert_url:
+            return {
+                "account": kid,
+                "order": order_id,
+                "path": str(Path(settings.CERT_STORAGE_PATH) / f"{cert_id}.pem"),
+            }
+    return None
+
+
 # Public key equality helper (module-level with full typing for mypy)
-PublicKeyTypes = Union[RSAPublicKey, EllipticCurvePublicKey]
+type PublicKeyTypes = RSAPublicKey | EllipticCurvePublicKey
 
 
 def public_keys_equal(a: PublicKeyTypes, b: PublicKeyTypes) -> bool:
@@ -93,38 +198,31 @@ async def verify_http01_challenge(challenge_id: str, authz_id: str, order_id: st
 
     domain = authz_obj["identifier"]["value"]
     token = challenge_obj["token"]
-    # ACME HTTP-01 challenge MUST be served on port 80 per RFC 8555
-    url = f"http://{domain}:80/.well-known/acme-challenge/{token}"
     expected_content = get_key_authorization(token, account_jwk)
 
     try:
+        approved_addresses = await resolve_http01_addresses(domain)
+        ip_address = approved_addresses[0]
+        logger.info(f"Resolved {domain} to approved HTTP-01 address {ip_address}")
+
+        # ACME HTTP-01 challenge MUST be served on port 80 per RFC 8555. Connect to
+        # the prevalidated address so a second DNS lookup cannot change the target.
+        url = f"http://{http_url_host(ip_address)}:80/.well-known/acme-challenge/{token}"
+
         # Security: Use strict HTTP client configuration
         timeout_config = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=10.0)
 
         async with httpx.AsyncClient(
-            follow_redirects=False,  # RFC requirement: no redirects allowed
+            follow_redirects=False,
+            trust_env=False,
             timeout=timeout_config,
             limits=httpx.Limits(max_keepalive_connections=0),  # Disable connection reuse
         ) as client:
-            # Resolve domain to IP for CIDR validation
-            try:
-                ip_address = socket.gethostbyname(domain)
-                logger.info(f"Resolved {domain} to IP {ip_address}")
-
-                # Validate IP against CIDR ranges if configured
-                if settings.ALLOWED_CHALLENGE_CIDR:
-                    if not validate_ip_in_cidr_ranges(ip_address, settings.ALLOWED_CHALLENGE_CIDR):
-                        raise Exception(
-                            f"Domain {domain} resolves to IP {ip_address} which is not in allowed CIDR ranges: {settings.ALLOWED_CHALLENGE_CIDR}"
-                        )
-
-            except socket.gaierror as e:
-                raise Exception(f"Failed to resolve domain {domain}: {e}")
-
             # Perform the HTTP-01 challenge request
             response = await client.get(
                 url,
                 headers={
+                    "Host": domain,
                     "User-Agent": "ACME-Proxy/1.0 HTTP-01-Validator",
                     "Accept": "text/plain, */*;q=0.1",
                 },
@@ -137,9 +235,7 @@ async def verify_http01_challenge(challenge_id: str, authz_id: str, order_id: st
         # RFC 8555: Validate content exactly matches key authorization
         response_content = response.text.strip()
         if response_content != expected_content:
-            raise Exception(
-                f"HTTP-01 challenge content mismatch. Expected: {expected_content}, Got: {response_content}"
-            )
+            raise Exception("HTTP-01 challenge content mismatch")
 
         # Validate Content-Type if present (should be text/plain)
         content_type = response.headers.get("content-type", "").lower()
@@ -152,6 +248,7 @@ async def verify_http01_challenge(challenge_id: str, authz_id: str, order_id: st
         await state.update_resource(challenge_id, "challenges", challenge_obj)
 
         authz_obj["status"] = "valid"
+        authz_obj["expires"] = acme_timestamp_after(AUTHORIZATION_EXPIRES_AFTER)
         await state.update_resource(authz_id, "authorizations", authz_obj)
 
         # Check if all authorizations for the order are now valid
@@ -159,7 +256,7 @@ async def verify_http01_challenge(challenge_id: str, authz_id: str, order_id: st
         for authz_url in order_obj["authorizations"]:
             authz_id_to_check = authz_url.split("/")[-1]
             authz_to_check = await state.get_resource(authz_id_to_check, "authorizations")
-            if authz_to_check and authz_to_check.get("status") != "valid":
+            if not authz_to_check or authz_to_check.get("status") != "valid":
                 all_valid = False
                 break
 
@@ -173,7 +270,7 @@ async def verify_http01_challenge(challenge_id: str, authz_id: str, order_id: st
         challenge_obj["status"] = "invalid"
         authz_obj["status"] = "invalid"
         order_obj["status"] = "invalid"
-        error = Problem(type="urn:ietf:params:acme:error:unauthorized", detail=str(e), status=403)
+        error = Problem(type="urn:ietf:params:acme:error:unauthorized", detail="HTTP-01 validation failed", status=403)
         challenge_obj["error"] = error.model_dump(by_alias=True, exclude_none=True)
         order_obj["error"] = error.model_dump(by_alias=True, exclude_none=True)
         await state.update_resource(challenge_id, "challenges", challenge_obj)
@@ -279,7 +376,16 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
 
         # Update order to valid
         order_obj_dict["status"] = "valid"
+        order_obj_dict.setdefault("expires", acme_timestamp_after(ORDER_EXPIRES_AFTER))
         order_obj_dict["certificate"] = full_url_for(f"acme/cert/{cert_id}")
+        await state.add_certificate(
+            cert_id,
+            {
+                "account": order_obj_dict["account"],
+                "order": order_id,
+                "path": str(cert_path),
+            },
+        )
         await state.update_resource(order_id, "orders", order_obj_dict)
         logger.info(f"Certificate for order {order_id} issued and stored at {cert_path}")
 
@@ -300,15 +406,15 @@ async def finalize_and_issue_cert(order_id: str, csr_pem: str, csr_der: bytes, a
 # --- ACME Endpoints ---
 
 
-@app.get("/directory", response_model=Directory)
+@app.get("/directory", response_model=Directory, response_model_exclude_none=True)
 async def get_directory(response: Response) -> Directory:
     await add_replay_nonce(response)
     dir_obj = Directory(
         new_nonce=full_url_for("acme/new-nonce"),
         new_account=full_url_for("acme/new-account"),
         new_order=full_url_for("acme/new-order"),
-        revoke_cert=full_url_for("acme/revoke-cert"),
-        key_change=full_url_for("acme/key-change"),
+        revoke_cert=None,
+        key_change=None,
     )
     return dir_obj
 
@@ -379,7 +485,16 @@ async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verif
 
     # Validate identifiers
     for ident in payload.identifiers:
-        if not ident.value.endswith(f".{settings.BASE_DOMAIN_SUFFIX}"):
+        if ident.type != "dns":
+            raise HTTPException(
+                status_code=400,
+                detail=Problem(
+                    type="urn:ietf:params:acme:error:unsupportedIdentifier",
+                    detail=f"Identifier type {ident.type} is not supported.",
+                    status=400,
+                ).model_dump(by_alias=True, exclude_none=True),
+            )
+        if not is_identifier_allowed(ident.value):
             raise HTTPException(
                 status_code=403,
                 detail=Problem(
@@ -407,27 +522,40 @@ async def new_order(response: Response, jws_data: dict[str, Any] = Depends(verif
     for ident in payload.identifiers:
         authz_id = str(uuid.uuid4())
         challenge_id = str(uuid.uuid4())
+        authz_identifier, is_wildcard = dns_identifier_for_authorization(ident.value)
+        authz_ident = ident.model_copy(update={"value": authz_identifier})
 
         challenge = Challenge(
             type="http-01",
             url=full_url_for(f"acme/chall/{challenge_id}"),
             token=generate_token(),
         )
-        auth = Authorization(identifier=ident, challenges=[challenge])
+        auth = Authorization(identifier=authz_ident, challenges=[challenge], wildcard=True if is_wildcard else None)
 
-        await state.add_challenge(challenge_id, challenge.model_dump(by_alias=True, exclude_none=True))
-        await state.add_authorization(authz_id, auth.model_dump(by_alias=True, exclude_none=True))
+        challenge_obj = challenge.model_dump(by_alias=True, exclude_none=True)
+        challenge_obj["account"] = kid
+        challenge_obj["authorization"] = authz_id
+        challenge_obj["order"] = order_id
+        auth_obj = auth.model_dump(by_alias=True, exclude_none=True)
+        auth_obj["account"] = kid
+        auth_obj["order"] = order_id
+
+        await state.add_challenge(challenge_id, challenge_obj)
+        await state.add_authorization(authz_id, auth_obj)
         auth_urls.append(full_url_for(f"acme/authz/{authz_id}"))
 
     order = Order(
         identifiers=payload.identifiers,
+        expires=acme_timestamp_after(ORDER_EXPIRES_AFTER),
         notBefore=payload.not_before,
         notAfter=payload.not_after,
         authorizations=auth_urls,
         finalize=full_url_for(f"acme/order/{order_id}/finalize"),
     )
 
-    await state.add_order(order_id, order.model_dump(by_alias=True, exclude_none=True))
+    order_obj = order.model_dump(by_alias=True, exclude_none=True)
+    order_obj["account"] = kid
+    await state.add_order(order_id, order_obj)
 
     response.headers["Location"] = full_url_for(f"acme/order/{order_id}")
     await add_replay_nonce(response)
@@ -448,25 +576,20 @@ async def respond_to_challenge(
     kid = jws_data["kid"]
     account_data = await state.get_account_by_kid(kid)
     challenge_obj = await state.get_resource(challenge_id, "challenges")
-    if not challenge_obj or not account_data:
+    if not challenge_obj or not account_data or not is_owned_by(challenge_obj, kid):
         raise HTTPException(status_code=404, detail="Resource not found")
 
-    challenge_obj["status"] = "processing"
-    await state.update_resource(challenge_id, "challenges", challenge_obj)
-
     # Find the corresponding authorization and order to pass IDs
-    authz_id, order_id = None, None
-    for oid, o in (await state.get_resource(None, "orders")).items():
-        for auth_url in o["authorizations"]:
-            aid = auth_url.split("/")[-1]
-            auth = await state.get_resource(aid, "authorizations")
-            if any(c["url"].endswith(challenge_id) for c in auth["challenges"]):
-                authz_id, order_id = aid, oid
-                break
-        if authz_id:
-            break
+    authz_id, order_id = await find_parent_ids_for_challenge(challenge_id, kid)
 
     if authz_id and order_id:
+        authz_obj = await state.get_resource(authz_id, "authorizations")
+        order_obj = await state.get_resource(order_id, "orders")
+        if not authz_obj or not order_obj or not is_owned_by(authz_obj, kid) or not is_owned_by(order_obj, kid):
+            raise HTTPException(status_code=404, detail="Resource not found")
+
+        challenge_obj["status"] = "processing"
+        await state.update_resource(challenge_id, "challenges", challenge_obj)
         background_tasks.add_task(
             verify_http01_challenge,
             challenge_id,
@@ -476,6 +599,7 @@ async def respond_to_challenge(
         )
     else:
         logger.error(f"Could not find parent authorization/order for challenge {challenge_id}")
+        raise HTTPException(status_code=404, detail="Resource not found")
 
     # Add standard headers including nonce and ACME directory index link
     await add_replay_nonce(response)
@@ -501,18 +625,13 @@ async def finalize_order(
 ) -> Order:
     payload = FinalizePayload(**jws_data["payload"])
     order_obj = await state.get_resource(order_id, "orders")
+    kid = jws_data["kid"]
 
-    # Get account JWK (could be from jwk field for new accounts or kid for existing)
     account_jwk = jws_data["jwk"]
-    if not account_jwk and "kid" in jws_data:
-        account_data = await state.get_account_by_kid(jws_data["kid"])
-        if account_data:
-            account_jwk = account_data["jwk"]
-
     if not account_jwk:
         raise HTTPException(status_code=500, detail="Could not retrieve account key")
 
-    if not order_obj:
+    if not order_obj or not is_owned_by(order_obj, kid):
         raise HTTPException(status_code=404, detail="Order not found")
     if order_obj["status"] != "ready":
         raise HTTPException(
@@ -549,6 +668,7 @@ async def finalize_order(
     csr_pem = "-----BEGIN CERTIFICATE REQUEST-----\n" + _wrap64(csr_der) + "\n-----END CERTIFICATE REQUEST-----"
 
     order_obj["status"] = "processing"
+    order_obj.setdefault("expires", acme_timestamp_after(ORDER_EXPIRES_AFTER))
     await state.update_resource(order_id, "orders", order_obj)
 
     # Pass all required parameters including CSR validation data
@@ -560,11 +680,15 @@ async def finalize_order(
 
 @app.post("/acme/cert/{cert_id}")
 async def download_cert(cert_id: str, response: Response, jws_data: dict[str, Any] = Depends(verify_jws)) -> Response:
-    cert_path = Path(settings.CERT_STORAGE_PATH) / f"{cert_id}.pem"
+    cert_obj = await get_owned_certificate(cert_id, jws_data["kid"])
+    if not cert_obj:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+
+    cert_path = Path(cert_obj.get("path", Path(settings.CERT_STORAGE_PATH) / f"{cert_id}.pem"))
     if not cert_path.exists():
         raise HTTPException(status_code=404, detail="Certificate not found")
 
-    with open(cert_path, "r") as f:
+    with open(cert_path, "r", encoding="utf-8") as f:
         cert_content = f.read()
 
     # Build the response object first so we can attach headers (nonce, link)
@@ -586,7 +710,7 @@ async def get_order(order_id: str, response: Response, jws_data: dict[str, Any] 
     if jws_data["payload"]:
         raise HTTPException(400, "Payload must be empty for POST-as-GET")
     order_obj = await state.get_resource(order_id, "orders")
-    if not order_obj:
+    if not order_obj or not is_owned_by(order_obj, jws_data["kid"]):
         raise HTTPException(404, "Order not found")
     await add_replay_nonce(response)
     return Order(**order_obj)
@@ -603,7 +727,7 @@ async def get_authorization(
     if jws_data["payload"]:
         raise HTTPException(400, "Payload must be empty for POST-as-GET")
     authz_obj = await state.get_resource(authz_id, "authorizations")
-    if not authz_obj:
+    if not authz_obj or not is_owned_by(authz_obj, jws_data["kid"]):
         raise HTTPException(404, "Authorization not found")
     await add_replay_nonce(response)
     return Authorization(**authz_obj)

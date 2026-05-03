@@ -1,10 +1,12 @@
 import os
 import stat
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     # --- Server Configuration ---
     # The public-facing base URL of this ACME server.
     # Clients like certbot will use this to construct resource URLs.
@@ -52,10 +54,6 @@ class Settings(BaseSettings):
 
     # JWS algorithms allowed for request signatures
     ALLOWED_JWS_ALGORITHMS: list[str] = ["ES256", "EdDSA", "RS256"]
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"  # Ignore extra env vars not defined in the model
 
 
 settings = Settings()

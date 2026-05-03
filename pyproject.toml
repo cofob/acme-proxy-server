@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=1.17.1",
+    "pytest>=8.4.2",
     "ruff>=0.12.7",
     "types-pygments>=2.19.0.20250715",
     "types-python-jose>=3.5.0.20250531",
@@ -34,6 +35,9 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [tool.mypy]
 pretty = true

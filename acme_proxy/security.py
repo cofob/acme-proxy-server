@@ -5,10 +5,11 @@ import hashlib
 import ipaddress
 import json
 import secrets
-from typing import Any, List, cast
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import NameOID
 
 
 def generate_nonce() -> str:
@@ -97,7 +98,7 @@ def get_key_authorization(token: str, public_jwk: dict[str, Any]) -> str:
     return f"{token}.{thumbprint}"
 
 
-def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict[str, Any]) -> None:
+def validate_csr(csr_der: bytes, order_identifiers: list[str], account_jwk: dict[str, Any]) -> None:
     """
     Validate a Certificate Signing Request according to RFC 8555 requirements.
 
@@ -124,20 +125,21 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
         if account_thumbprint == csr_thumbprint:
             raise ValueError("CSR public key must not be the same as account key")
 
-        # 2. Extract identifiers from CSR (SANs are authoritative for ACME matching).
+        # 2. Extract identifiers from CSR.
         csr_dns_names: set[str] = set()
         san_dns_names_list: list[str] = []  # preserve order to detect duplicates in SAN
+        cn_dns_names_list: list[str] = []  # acme.sh derives domains from both CN and SAN in --signcsr mode
 
         # Check Subject Alternative Name extension
         try:
             san_ext = csr.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
             san_value = san_ext.value
-            san_typed = cast(x509.SubjectAlternativeName, san_value)
-            dns_names = san_typed.get_values_for_type(x509.DNSName)
-            for dns_name in dns_names:
-                normalized = normalize_dns_identifier(dns_name)
-                san_dns_names_list.append(normalized)
-                csr_dns_names.add(normalized)
+            if isinstance(san_value, x509.SubjectAlternativeName):
+                dns_names = san_value.get_values_for_type(x509.DNSName)
+                for dns_name in dns_names:
+                    normalized = normalize_dns_identifier(dns_name)
+                    san_dns_names_list.append(normalized)
+                    csr_dns_names.add(normalized)
         except x509.ExtensionNotFound:
             pass  # SAN extension is optional
 
@@ -149,7 +151,21 @@ def validate_csr(csr_der: bytes, order_identifiers: List[str], account_jwk: dict
                 status=400,
             )
 
-        # CN is ignored for matching and duplicate checks; SANs are authoritative.
+        # RFC 8555 permits DNS identifiers in commonName, subjectAltName, or both.
+        for common_name in csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+            if not isinstance(common_name.value, str):
+                raise ValueError("CSR commonName must be a string")
+            normalized = normalize_dns_identifier(common_name.value)
+            cn_dns_names_list.append(normalized)
+            csr_dns_names.add(normalized)
+
+        # Multiple CNs are ambiguous and are collapsed differently by clients and issuers.
+        if len(cn_dns_names_list) != len(set(cn_dns_names_list)):
+            raise AcmeProblemError(
+                problem_type="urn:ietf:params:acme:error:rejectedIdentifier",
+                detail="One or more identifiers are duplicated in the CSR commonName",
+                status=400,
+            )
 
         # 3. Verify CSR identifiers match order identifiers exactly
         order_dns_names = {normalize_dns_identifier(identifier) for identifier in order_identifiers}
@@ -246,7 +262,7 @@ def validate_ip_in_cidr_ranges(ip_address: str, cidr_ranges: str) -> bool:
         return False
 
 
-def is_algorithm_allowed(algorithm: str, allowed_algorithms: List[str]) -> bool:
+def is_algorithm_allowed(algorithm: str, allowed_algorithms: list[str]) -> bool:
     """
     Check if a JWS algorithm is in the allowed list.
 
