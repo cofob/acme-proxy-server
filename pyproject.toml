@@ -5,7 +5,7 @@ description = "ACME implementation in Python that proxies all local requests to 
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "cryptography>=45.0.5",
+    "cryptography>=46.0.7",
     "fastapi>=0.116.1",
     "httpx>=0.28.1",
     "pydantic>=2.11.7",
